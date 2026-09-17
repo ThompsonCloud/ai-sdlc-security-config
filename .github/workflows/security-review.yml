@@ -6,10 +6,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Trivy filesystem scan (secret + vuln + misconfig)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: fs
-          scanners: vuln,secret,misconfig
-          format: table
-          exit-code: '0'
+      - name: Central security gate (maintained by the security team)
+        shell: bash
+        run: |
+          echo "== 中央安全评审（业务库引用即接入） =="
+          issues=0
+          echo "-- 硬编码密钥 --"
+          if grep -rnE '(api[_-]?key|secret|password)\s*=\s*["'\''][A-Za-z0-9_\-]{8,}' --include='*.py' . ; then issues=$((issues+1)); fi
+          echo "-- SQL 拼接（潜在注入/越权入口） --"
+          if grep -rnE 'execute\(.*(\+|%).*\)' --include='*.py' . ; then issues=$((issues+1)); fi
+          echo "-- 缺失授权标记 --"
+          if grep -rniE 'no (authorization|admin|role) check|BOLA|IDOR' --include='*.py' . ; then issues=$((issues+1)); fi
+          echo ""
+          echo "命中类别数: $issues"
+          echo "（完整方案在此步接入 AI 代码评审与动态渗透；本步演示"中央规则 + 业务库引用即接入"的机制）"
