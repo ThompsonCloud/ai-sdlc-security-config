@@ -12,16 +12,22 @@ jobs:
           export HOME=/root
           export PATH=$PATH:/usr/local/bin:/usr/bin
           which ocr || { echo "::error::ocr 未安装"; exit 2; }
-          ocr scan --path . 2>&1 | tee ocr-out.txt || true
-          echo "## AI 代码评审结果（走通义千问）" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E '^\[(security|bug)|vuln.py|app.py|Summary' ocr-out.txt >> "$GITHUB_STEP_SUMMARY" || echo "无发现" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          : > ocr-out.txt
+          for f in $(git ls-files '*.py'); do
+            echo "===== 评审 $f =====" | tee -a ocr-out.txt
+            ocr scan --path "$f" 2>&1 | tee -a ocr-out.txt || true
+          done
+          {
+            echo "## AI 代码评审结果（open-code-review 走通义千问 qwen3.7-max）"
+            echo '```'
+            grep -E 'security . (critical|high|medium)|Summary|越权|IDOR|Authorization|Injection|=====' ocr-out.txt || echo "无发现"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: 安全门禁（发现严重/高危即阻断）
         shell: bash
         run: |
-          if grep -qE '\[security . (critical|high)\]' ocr-out.txt; then
-            n=$(grep -cE '\[security . (critical|high)\]' ocr-out.txt)
+          if grep -qiE 'security . (critical|high)' ocr-out.txt; then
+            n=$(grep -ciE 'security . (critical|high)' ocr-out.txt)
             echo "::error::安全门禁 BLOCK：发现 $n 处严重/高危安全问题（含越权/未授权），阻断合并"
             exit 1
           fi
