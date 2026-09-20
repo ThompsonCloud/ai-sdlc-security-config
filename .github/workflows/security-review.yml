@@ -111,7 +111,9 @@ jobs:
       - name: 节点⑦ 安全门禁（OPA/Rego 策略即代码）
         shell: bash
         run: |
-          ocr_high=$(grep -ciE 'security . (critical|high)' ocr-out.txt || echo 0)
+          # 注：grep -c 在零匹配时会「打印 0 且退出码 1」，旧写法 `|| echo 0` 会再追加一个 0，
+          # 得到 "0\n0" → 渲染成 "0 0" → OPA 当成非零字符串 → 误 BLOCK。改 `|| true` 只吞退出码、不追加输出。
+          ocr_high=$(grep -ciE 'security . (critical|high)' ocr-out.txt 2>/dev/null || true); ocr_high=${ocr_high:-0}
           gl=$(cat .gl_count 2>/dev/null || echo 0); tv=$(cat .tv_count 2>/dev/null || echo 0); sg=$(cat .sg_count 2>/dev/null || echo 0)
           crit="${ASSET_CRITICALITY:-high}"
           printf '{"ocr_high":%s,"gitleaks":%s,"semgrep_error":%s,"trivy":%s,"asset_criticality":"%s"}\n' "${ocr_high:-0}" "${gl:-0}" "${sg:-0}" "${tv:-0}" "$crit" > gate-input.json
