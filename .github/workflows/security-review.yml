@@ -100,7 +100,7 @@ jobs:
           for f in semgrep.sarif gitleaks.sarif trivy.sarif; do
             if [ -f "$f" ]; then
               curl -s -m 90 -X POST "$DD_URL/api/v2/import-scan/" -H "Authorization: Token $DD_KEY" \
-                -F "auto_create_context=true" -F "product_name=ai-sdlc-demo-vuln" -F "engagement_name=CI-Security" \
+                -F "auto_create_context=true" -F "product_type_name=AI-SDLC" -F "product_name=ai-sdlc-demo-vuln" -F "engagement_name=CI-Security" \
                 -F "scan_type=SARIF" -F "active=true" -F "verified=false" -F "minimum_severity=Info" \
                 -F "file=@$f" >/dev/null 2>&1 && imported="$imported $f"
             fi
