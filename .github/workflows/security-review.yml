@@ -1,12 +1,23 @@
 name: Central Security Review (reusable)
+
+# 中央可复用安全工作流：一条流水线里跑多个独立扫描节点，结果统一 SARIF、汇总到门禁。
+# 节点：① ocr AI 代码评审(千问,查越权/注入/密钥) ② Gitleaks(密钥) ③ Trivy(依赖CVE+SBOM,报告态)
+#       ④ Semgrep(静态SAST) ⑤ 统一 SARIF 上传 GitHub 安全页 ⑥ 门禁(任一严重/高危即阻断)
 on:
   workflow_call: {}
+
+permissions:
+  contents: read
+  security-events: write   # 供 SARIF 上传到 Code Scanning
+
 jobs:
   ai-security-review:
     runs-on: [self-hosted, ai-sdlc]
     steps:
       - uses: actions/checkout@v4
-      - name: AI 代码评审（open-code-review · 通义千问）
+
+      # ① AI 代码评审（越权/注入/硬编码密钥，走千问）
+      - name: 节点① open-code-review AI 代码评审（通义千问）
         shell: bash
         run: |
           export HOME=/root
@@ -18,17 +29,83 @@ jobs:
             ocr scan --path "$f" 2>&1 | tee -a ocr-out.txt || true
           done
           {
-            echo "## AI 代码评审结果（open-code-review 走通义千问 qwen3.7-max）"
+            echo "## 🤖 节点① AI 代码评审（open-code-review · qwen3.7-max）"
             echo '```'
             grep -E 'security . (critical|high|medium)|Summary|越权|IDOR|Authorization|Injection|=====' ocr-out.txt || echo "无发现"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: 安全门禁（发现严重/高危即阻断）
+
+      # ② Gitleaks 密钥扫描（Docker，无需在 runner 预装）
+      - name: 节点② Gitleaks 密钥扫描
         shell: bash
         run: |
-          if grep -qiE 'security . (critical|high)' ocr-out.txt; then
-            n=$(grep -ciE 'security . (critical|high)' ocr-out.txt)
-            echo "::error::安全门禁 BLOCK：发现 $n 处严重/高危安全问题（含越权/未授权），阻断合并"
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --no-git --report-format sarif --report-path /repo/gitleaks.sarif --exit-code 0 || true
+          gl=$(python3 -c "import json;d=json.load(open('gitleaks.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo 0)
+          echo "${gl:-0}" > .gl_count
+          {
+            echo "## 🔑 节点② Gitleaks 密钥扫描：发现 **${gl:-0}** 处硬编码密钥"
+            [ "${gl:-0}" -gt 0 ] && python3 -c "import json;[print('- ',x.get('ruleId'),'@',(x.get('locations') or [{}])[0].get('physicalLocation',{}).get('artifactLocation',{}).get('uri','')) for r in json.load(open('gitleaks.sarif')).get('runs',[]) for x in r.get('results',[])]" 2>/dev/null | head -10 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ③ Trivy 依赖CVE + 配置 + SBOM（报告态，不阻断——依赖 CVE 属分级 triage）
+      - name: 节点③ Trivy 依赖/配置扫描 + SBOM（报告态）
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
+            fs /repo --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --format sarif --output /repo/trivy.sarif --quiet || true
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
+            fs /repo --format cyclonedx --output /repo/sbom.cdx.json --quiet || true
+          tv=$(python3 -c "import json;d=json.load(open('trivy.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo 0)
+          echo "${tv:-0}" > .tv_count
+          {
+            echo "## 📦 节点③ Trivy 依赖/配置扫描（HIGH/CRITICAL）：**${tv:-0}** 处（报告态，不阻断）；已生成 SBOM \`sbom.cdx.json\`"
+            [ "${tv:-0}" -gt 0 ] && python3 -c "import json;[print('- ',(x.get('ruleId') or '')[:60],'—',(x.get('message',{}) or {}).get('text','')[:70]) for r in json.load(open('trivy.sarif')).get('runs',[]) for x in r.get('results',[])]" 2>/dev/null | head -10 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ④ Semgrep 静态 SAST（开源静态基线，替代 CodeQL）
+      - name: 节点④ Semgrep 静态 SAST
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/src" semgrep/semgrep:latest \
+            semgrep scan --config=p/python --config=p/security-audit --metrics=off --sarif --output=/src/semgrep.sarif /src || true
+          sgall=$(python3 -c "import json;d=json.load(open('semgrep.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo 0)
+          sgerr=$(python3 -c "import json;d=json.load(open('semgrep.sarif'));print(sum(1 for r in d.get('runs',[]) for x in r.get('results',[]) if x.get('level')=='error'))" 2>/dev/null || echo 0)
+          echo "${sgerr:-0}" > .sg_count
+          {
+            echo "## 🔎 节点④ Semgrep 静态扫描：**${sgall:-0}** 处（其中 error 级 **${sgerr:-0}**）"
+            [ "${sgall:-0}" -gt 0 ] && python3 -c "import json;[print('- [',x.get('level'),']',(x.get('ruleId') or '')[:55]) for r in json.load(open('semgrep.sarif')).get('runs',[]) for x in r.get('results',[])]" 2>/dev/null | head -10 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ⑤ 统一 SARIF 上传到 GitHub 安全页（失败不阻断整条流水线）
+      - name: 节点⑤ 上传 SARIF 到 Code Scanning
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .
+
+      # ⑥ 门禁：ocr严重/高危、Gitleaks任一密钥、Semgrep error 命中即 BLOCK；Trivy 依赖CVE 报告态
+      - name: 节点⑥ 安全门禁（汇总多工具）
+        shell: bash
+        run: |
+          block=0; reasons=""
+          if grep -qiE 'security . (critical|high)' ocr-out.txt; then block=1; reasons="${reasons}ocr代码评审(严重/高危); "; fi
+          gl=$(cat .gl_count 2>/dev/null || echo 0); tv=$(cat .tv_count 2>/dev/null || echo 0); sg=$(cat .sg_count 2>/dev/null || echo 0)
+          [ "${gl:-0}" -gt 0 ] && { block=1; reasons="${reasons}Gitleaks密钥(${gl}); "; }
+          [ "${sg:-0}" -gt 0 ] && { block=1; reasons="${reasons}Semgrep静态error(${sg}); "; }
+          {
+            echo "## 🚦 节点⑥ 门禁汇总"
+            echo "| 节点 | 结果 | 是否阻断 |"
+            echo "|---|---|---|"
+            echo "| ① ocr AI 评审 | 见上 | 阻断(严重/高危) |"
+            echo "| ② Gitleaks 密钥 | ${gl} | 阻断(任一) |"
+            echo "| ③ Trivy 依赖CVE | ${tv} | 报告态·不阻断 |"
+            echo "| ④ Semgrep 静态 | error ${sg} | 阻断(error) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$block" = 1 ]; then
+            echo "::error::安全门禁 BLOCK：${reasons}阻断合并"
+            echo "## ⛔ 门禁 BLOCK：${reasons}" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "✅ 安全门禁 PASS：无严重/高危问题"
+          echo "✅ 安全门禁 PASS：各阻断类节点均无严重/高危"
+          echo "## ✅ 门禁 PASS：各阻断类节点均无严重/高危（Trivy 依赖 CVE 见报告态汇总）" >> "$GITHUB_STEP_SUMMARY"
