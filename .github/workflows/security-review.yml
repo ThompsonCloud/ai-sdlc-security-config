@@ -2,7 +2,8 @@ name: Central Security Review (reusable)
 
 # 中央可复用安全工作流：一条流水线里跑多个独立扫描节点，结果统一 SARIF、汇总到门禁。
 # 节点：① ocr AI 代码评审(千问,查越权/注入/密钥) ② Gitleaks(密钥) ③ Trivy(依赖CVE+SBOM,报告态)
-#       ④ Semgrep(静态SAST) ⑤ 统一 SARIF 上传 GitHub 安全页 ⑥ 门禁(任一严重/高危即阻断)
+#       ④ Semgrep(静态SAST) ⑤ 统一 SARIF 上传 GitHub 安全页 ⑥ 上报 DefectDojo 台账
+#       ⑦ 门禁(OPA/Rego 策略即代码，策略取自 policy/gate.rego)
 on:
   workflow_call: {}
 
@@ -85,27 +86,49 @@ jobs:
           sarif_file: .
 
       # ⑥ 门禁：ocr严重/高危、Gitleaks任一密钥、Semgrep error 命中即 BLOCK；Trivy 依赖CVE 报告态
-      - name: 节点⑥ 安全门禁（汇总多工具）
+      # ⑥ 上报 DefectDojo 统一漏洞台账（报告态；DD 不可达则跳过）
+      - name: 节点⑥ 上报 DefectDojo 台账
         shell: bash
         run: |
-          block=0; reasons=""
-          if grep -qiE 'security . (critical|high)' ocr-out.txt; then block=1; reasons="${reasons}ocr代码评审(严重/高危); "; fi
+          DD_URL="${DEFECTDOJO_URL:-http://localhost:8080}"
+          DD_KEY="$(cat /root/.config/ai-sdlc/defectdojo.key 2>/dev/null || echo '')"
+          if [ -z "$DD_KEY" ] || ! curl -sf -m 6 "$DD_URL/api/v2/user_profile/" -H "Authorization: Token $DD_KEY" >/dev/null 2>&1; then
+            echo "## 📇 节点⑥ DefectDojo：未配置或不可达，跳过（把 API key 放 /root/.config/ai-sdlc/defectdojo.key）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          imported=""
+          for f in semgrep.sarif gitleaks.sarif trivy.sarif; do
+            if [ -f "$f" ]; then
+              curl -s -m 90 -X POST "$DD_URL/api/v2/import-scan/" -H "Authorization: Token $DD_KEY" \
+                -F "auto_create_context=true" -F "product_name=ai-sdlc-demo-vuln" -F "engagement_name=CI-Security" \
+                -F "scan_type=SARIF" -F "active=true" -F "verified=false" -F "minimum_severity=Info" \
+                -F "file=@$f" >/dev/null 2>&1 && imported="$imported $f"
+            fi
+          done
+          echo "## 📇 节点⑥ DefectDojo 台账：已上报 SARIF ->${imported:- (无)}（product=ai-sdlc-demo-vuln / engagement=CI-Security）" >> "$GITHUB_STEP_SUMMARY"
+
+      # ⑦ 门禁：OPA/Rego 策略即代码（策略取自中央仓库 policy/gate.rego，版本化）
+      - name: 节点⑦ 安全门禁（OPA/Rego 策略即代码）
+        shell: bash
+        run: |
+          ocr_high=$(grep -ciE 'security . (critical|high)' ocr-out.txt || echo 0)
           gl=$(cat .gl_count 2>/dev/null || echo 0); tv=$(cat .tv_count 2>/dev/null || echo 0); sg=$(cat .sg_count 2>/dev/null || echo 0)
-          [ "${gl:-0}" -gt 0 ] && { block=1; reasons="${reasons}Gitleaks密钥(${gl}); "; }
-          [ "${sg:-0}" -gt 0 ] && { block=1; reasons="${reasons}Semgrep静态error(${sg}); "; }
+          crit="${ASSET_CRITICALITY:-high}"
+          printf '{"ocr_high":%s,"gitleaks":%s,"semgrep_error":%s,"trivy":%s,"asset_criticality":"%s"}\n' "${ocr_high:-0}" "${gl:-0}" "${sg:-0}" "${tv:-0}" "$crit" > gate-input.json
+          curl -sSL -o gate.rego https://raw.githubusercontent.com/ThompsonCloud/ai-sdlc-security-config/main/policy/gate.rego
+          res=$(docker run --rm -i -v "$PWD:/w" -w /w openpolicyagent/opa:latest eval -I -f json -d gate.rego 'data.aisdlc.gate' < gate-input.json 2>/dev/null)
+          dec=$(echo "$res" | python3 -c "import sys,json;print(json.load(sys.stdin)['result'][0]['expressions'][0]['value'].get('decision','pass'))" 2>/dev/null || echo pass)
+          reasons=$(echo "$res" | python3 -c "import sys,json;print('; '.join(json.load(sys.stdin)['result'][0]['expressions'][0]['value'].get('reasons',[])))" 2>/dev/null || echo '')
           {
-            echo "## 🚦 节点⑥ 门禁汇总"
-            echo "| 节点 | 结果 | 是否阻断 |"
-            echo "|---|---|---|"
-            echo "| ① ocr AI 评审 | 见上 | 阻断(严重/高危) |"
-            echo "| ② Gitleaks 密钥 | ${gl} | 阻断(任一) |"
-            echo "| ③ Trivy 依赖CVE | ${tv} | 报告态·不阻断 |"
-            echo "| ④ Semgrep 静态 | error ${sg} | 阻断(error) |"
+            echo "## 🚦 节点⑦ OPA/Rego 门禁（策略即代码）"
+            echo "- 策略：\`policy/gate.rego\`（中央仓库·版本化）"
+            echo "- 输入：\`$(cat gate-input.json)\`"
+            echo "- **决策：${dec}**；原因：${reasons:-无}"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$block" = 1 ]; then
-            echo "::error::安全门禁 BLOCK：${reasons}阻断合并"
+          if [ "$dec" = "block" ]; then
+            echo "::error::OPA/Rego 门禁 BLOCK：${reasons}"
             echo "## ⛔ 门禁 BLOCK：${reasons}" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "✅ 安全门禁 PASS：各阻断类节点均无严重/高危"
-          echo "## ✅ 门禁 PASS：各阻断类节点均无严重/高危（Trivy 依赖 CVE 见报告态汇总）" >> "$GITHUB_STEP_SUMMARY"
+          echo "✅ OPA/Rego 门禁：${dec}（${reasons:-无严重/高危}）"
+          echo "## ✅ 门禁 ${dec}" >> "$GITHUB_STEP_SUMMARY"
