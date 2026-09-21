@@ -17,23 +17,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ① AI 代码评审（越权/注入/硬编码密钥，走千问）
+      # ① AI 代码评审（越权/注入/硬编码密钥，走千问）→ 输出 SARIF，进安全页/台账/门禁
       - name: 节点① open-code-review AI 代码评审（通义千问）
         shell: bash
         run: |
           export HOME=/root
           export PATH=$PATH:/usr/local/bin:/usr/bin
           which ocr || { echo "::error::ocr 未安装"; exit 2; }
-          : > ocr-out.txt
+          rm -f ocr-part-*.sarif ocr.sarif .ocr_count
+          i=0
           for f in $(git ls-files '*.py'); do
-            echo "===== 评审 $f =====" | tee -a ocr-out.txt
-            ocr scan --path "$f" 2>&1 | tee -a ocr-out.txt || true
+            ocr scan --path "$f" --format sarif -o "ocr-part-$i.sarif" 2>>ocr-stderr.txt || true
+            i=$((i+1))
           done
+          # 合并各文件 SARIF、仅留 security 类结果 → ocr.sarif（脚本取自中央仓库，版本化）
+          curl -sSL -o merge_ocr.py https://raw.githubusercontent.com/ThompsonCloud/ai-sdlc-security-config/main/scripts/merge_ocr_sarif.py
+          python3 merge_ocr.py || echo 0 > .ocr_count
+          rm -f ocr-part-*.sarif   # 只留合并后的 ocr.sarif，供节点⑤上传
+          n=$(cat .ocr_count 2>/dev/null || echo 0)
           {
-            echo "## 🤖 节点① AI 代码评审（open-code-review · qwen3.7-max）"
-            echo '```'
-            grep -E 'security . (critical|high|medium)|Summary|越权|IDOR|Authorization|Injection|=====' ocr-out.txt || echo "无发现"
-            echo '```'
+            echo "## 🤖 节点① AI 代码评审（open-code-review · 千问）：security 类 **${n}** 处（→ SARIF 进安全页/台账/门禁）"
+            python3 -c "import json;[print('- ',(x.get('message',{}) or {}).get('text','')[:110]) for x in json.load(open('ocr.sarif'))['runs'][0]['results']]" 2>/dev/null | head -12 || echo "（无 security 发现）"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # ② Gitleaks 密钥扫描（Docker，无需在 runner 预装）
@@ -85,9 +89,9 @@ jobs:
         with:
           sarif_file: .
 
-      # ⑥ 门禁：ocr严重/高危、Gitleaks任一密钥、Semgrep error 命中即 BLOCK；Trivy 依赖CVE 报告态
-      # ⑥ 上报 DefectDojo 统一漏洞台账（报告态；DD 不可达则跳过）
-      - name: 节点⑥ 上报 DefectDojo 台账
+      # ⑥ 上报 DefectDojo 统一漏洞台账——用 reimport-scan（按工具分 test，同一 test 反复覆盖：
+      #    再次出现的判为已存在、消失的判为 mitigated，正好贴合 CI 反复跑，不再堆重复）。DD 不可达则跳过。
+      - name: 节点⑥ 上报 DefectDojo 台账（reimport，按工具分 test）
         shell: bash
         run: |
           DD_URL="${DEFECTDOJO_URL:-http://localhost:8080}"
@@ -97,23 +101,27 @@ jobs:
             exit 0
           fi
           imported=""
-          for f in semgrep.sarif gitleaks.sarif trivy.sarif; do
-            if [ -f "$f" ]; then
-              curl -s -m 90 -X POST "$DD_URL/api/v2/import-scan/" -H "Authorization: Token $DD_KEY" \
-                -F "auto_create_context=true" -F "product_type_name=AI-SDLC" -F "product_name=ai-sdlc-demo-vuln" -F "engagement_name=CI-Security" \
-                -F "scan_type=SARIF" -F "active=true" -F "verified=false" -F "minimum_severity=Info" \
-                -F "file=@$f" >/dev/null 2>&1 && imported="$imported $f"
-            fi
-          done
-          echo "## 📇 节点⑥ DefectDojo 台账：已上报 SARIF ->${imported:- (无)}（product=ai-sdlc-demo-vuln / engagement=CI-Security）" >> "$GITHUB_STEP_SUMMARY"
+          reimport_one() {
+            [ -f "$1" ] || return 0
+            curl -s -m 120 -X POST "$DD_URL/api/v2/reimport-scan/" -H "Authorization: Token $DD_KEY" \
+              -F "auto_create_context=true" -F "product_type_name=AI-SDLC" -F "product_name=ai-sdlc-demo-vuln" \
+              -F "engagement_name=CI-Security" -F "scan_type=SARIF" -F "test_title=$2" \
+              -F "active=true" -F "verified=false" -F "minimum_severity=Info" -F "close_old_findings=true" \
+              -F "file=@$1" >/dev/null 2>&1 && imported="$imported $2"
+          }
+          reimport_one ocr.sarif      "ocr-AI评审"
+          reimport_one gitleaks.sarif "gitleaks-密钥"
+          reimport_one trivy.sarif    "trivy-依赖"
+          reimport_one semgrep.sarif  "semgrep-静态"
+          echo "## 📇 节点⑥ DefectDojo 台账（reimport-scan · 按工具分 test）：${imported:- (无)}（product=ai-sdlc-demo-vuln / engagement=CI-Security）" >> "$GITHUB_STEP_SUMMARY"
 
       # ⑦ 门禁：OPA/Rego 策略即代码（策略取自中央仓库 policy/gate.rego，版本化）
       - name: 节点⑦ 安全门禁（OPA/Rego 策略即代码）
         shell: bash
         run: |
-          # 注：grep -c 在零匹配时会「打印 0 且退出码 1」，旧写法 `|| echo 0` 会再追加一个 0，
-          # 得到 "0\n0" → 渲染成 "0 0" → OPA 当成非零字符串 → 误 BLOCK。改 `|| true` 只吞退出码、不追加输出。
-          ocr_high=$(grep -ciE 'security . (critical|high)' ocr-out.txt 2>/dev/null || true); ocr_high=${ocr_high:-0}
+          # ocr 计数改从节点①产出的 .ocr_count 读（= ocr.sarif 里 security 类结果数）；
+          # ocr 现在只出 SARIF，安全页/台账/门禁共用一份，不再 grep 文本。
+          ocr_high=$(cat .ocr_count 2>/dev/null || echo 0); ocr_high=${ocr_high:-0}
           gl=$(cat .gl_count 2>/dev/null || echo 0); tv=$(cat .tv_count 2>/dev/null || echo 0); sg=$(cat .sg_count 2>/dev/null || echo 0)
           crit="${ASSET_CRITICALITY:-high}"
           printf '{"ocr_high":%s,"gitleaks":%s,"semgrep_error":%s,"trivy":%s,"asset_criticality":"%s"}\n' "${ocr_high:-0}" "${gl:-0}" "${sg:-0}" "${tv:-0}" "$crit" > gate-input.json
