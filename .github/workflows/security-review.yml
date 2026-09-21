@@ -96,8 +96,16 @@ jobs:
         run: |
           DD_URL="${DEFECTDOJO_URL:-http://localhost:8080}"
           DD_KEY="$(cat /root/.config/ai-sdlc/defectdojo.key 2>/dev/null || echo '')"
-          if [ -z "$DD_KEY" ] || ! curl -sf -m 6 "$DD_URL/api/v2/user_profile/" -H "Authorization: Token $DD_KEY" >/dev/null 2>&1; then
-            echo "## 📇 节点⑥ DefectDojo：未配置或不可达，跳过（把 API key 放 /root/.config/ai-sdlc/defectdojo.key）" >> "$GITHUB_STEP_SUMMARY"
+          # 可达性探测放宽：单次 6s 在扫描/Dify 共存的负载下会超时误跳过，改成重试 3 次、每次 20s
+          dd_up=0
+          if [ -n "$DD_KEY" ]; then
+            for _ in 1 2 3; do
+              if curl -sf -m 20 "$DD_URL/api/v2/user_profile/" -H "Authorization: Token $DD_KEY" >/dev/null 2>&1; then dd_up=1; break; fi
+              sleep 5
+            done
+          fi
+          if [ "$dd_up" != 1 ]; then
+            echo "## 📇 节点⑥ DefectDojo：未配置或不可达（重试 3×20s 仍失败），跳过" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           imported=""
