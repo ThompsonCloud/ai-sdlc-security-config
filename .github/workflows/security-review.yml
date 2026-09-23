@@ -24,19 +24,20 @@ jobs:
           export HOME=/root
           export PATH=$PATH:/usr/local/bin:/usr/bin
           which ocr || { echo "::error::ocr 未安装"; exit 2; }
-          rm -f ocr-part-*.sarif ocr.sarif .ocr_count
+          rm -f ocr-part-*.json ocr.sarif ocr-generic.json .ocr_count
           i=0
           for f in $(git ls-files '*.py'); do
-            ocr scan --path "$f" --format sarif -o "ocr-part-$i.sarif" 2>>ocr-stderr.txt || true
+            # 用原生 JSON（含 suggestion_code/severity/thinking），比 SARIF 多出修复建议与触发路径
+            ocr scan --path "$f" --format json -o "ocr-part-$i.json" 2>>ocr-stderr.txt || true
             i=$((i+1))
           done
-          # 合并各文件 SARIF、仅留 security 类结果 → ocr.sarif（脚本取自中央仓库，版本化）
+          # 合并 ocr 原生 JSON → ocr.sarif（安全页）+ ocr-generic.json（DefectDojo 带修复建议/复现步骤）+ .ocr_count
           curl -sSL -o merge_ocr.py https://raw.githubusercontent.com/ThompsonCloud/ai-sdlc-security-config/main/scripts/merge_ocr_sarif.py
           python3 merge_ocr.py || echo 0 > .ocr_count
-          rm -f ocr-part-*.sarif   # 只留合并后的 ocr.sarif，供节点⑤上传
+          rm -f ocr-part-*.json   # 只留合并产物
           n=$(cat .ocr_count 2>/dev/null || echo 0)
           {
-            echo "## 🤖 节点① AI 代码评审（open-code-review · 千问）：security 类 **${n}** 处（→ SARIF 进安全页/台账/门禁）"
+            echo "## 🤖 节点① AI 代码评审（open-code-review · 千问）：security 类 **${n}** 处（→ 安全页 + DefectDojo〔含修复建议/复现步骤〕+ 门禁）"
             python3 -c "import json;[print('- ',(x.get('message',{}) or {}).get('text','')[:110]) for x in json.load(open('ocr.sarif'))['runs'][0]['results']]" 2>/dev/null | head -12 || echo "（无 security 发现）"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -108,27 +109,31 @@ jobs:
             echo "## 📇 节点⑥ DefectDojo：未配置或不可达（重试 3×20s 仍失败），跳过" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          # 产品名按调用方仓库自动分（客户各自的仓库 → 各自的 product），回退到 demo 名
+          DD_PRODUCT="${GITHUB_REPOSITORY##*/}"; DD_PRODUCT="${DD_PRODUCT:-ai-sdlc-demo-vuln}"
           imported=""
           reimport_one() {
+            # $1=文件 $2=test_title $3=scan_type（默认 SARIF）
             [ -f "$1" ] || return 0
             curl -s -m 120 -X POST "$DD_URL/api/v2/reimport-scan/" -H "Authorization: Token $DD_KEY" \
-              -F "auto_create_context=true" -F "product_type_name=AI-SDLC" -F "product_name=ai-sdlc-demo-vuln" \
-              -F "engagement_name=CI-Security" -F "scan_type=SARIF" -F "test_title=$2" \
+              -F "auto_create_context=true" -F "product_type_name=AI-SDLC" -F "product_name=$DD_PRODUCT" \
+              -F "engagement_name=CI-Security" -F "scan_type=${3:-SARIF}" -F "test_title=$2" \
               -F "active=true" -F "verified=false" -F "minimum_severity=Info" -F "close_old_findings=true" \
               -F "file=@$1" >/dev/null 2>&1 && imported="$imported $2"
           }
-          reimport_one ocr.sarif      "ocr-AI评审"
-          reimport_one gitleaks.sarif "gitleaks-密钥"
-          reimport_one trivy.sarif    "trivy-依赖"
-          reimport_one semgrep.sarif  "semgrep-静态"
-          echo "## 📇 节点⑥ DefectDojo 台账（reimport-scan · 按工具分 test）：${imported:- (无)}（product=ai-sdlc-demo-vuln / engagement=CI-Security）" >> "$GITHUB_STEP_SUMMARY"
+          # ocr 走 Generic Findings Import（带 mitigation 修复建议 + steps_to_reproduce 复现步骤）
+          reimport_one ocr-generic.json "ocr-AI评审" "Generic Findings Import"
+          reimport_one gitleaks.sarif   "gitleaks-密钥"
+          reimport_one trivy.sarif      "trivy-依赖"
+          reimport_one semgrep.sarif    "semgrep-静态"
+          echo "## 📇 节点⑥ DefectDojo 台账（reimport-scan · 按工具分 test）：${imported:- (无)}（product=$DD_PRODUCT / engagement=CI-Security；ocr 带修复建议+复现步骤）" >> "$GITHUB_STEP_SUMMARY"
 
       # ⑦ 门禁：OPA/Rego 策略即代码（策略取自中央仓库 policy/gate.rego，版本化）
       - name: 节点⑦ 安全门禁（OPA/Rego 策略即代码）
         shell: bash
         run: |
-          # ocr 计数改从节点①产出的 .ocr_count 读（= ocr.sarif 里 security 类结果数）；
-          # ocr 现在只出 SARIF，安全页/台账/门禁共用一份，不再 grep 文本。
+          # ocr 计数从节点①产出的 .ocr_count 读（= security 类结果数）；
+          # ocr 原生 JSON 一次产出：ocr.sarif（安全页）/ ocr-generic.json（台账）/ .ocr_count（门禁），不再 grep 文本。
           ocr_high=$(cat .ocr_count 2>/dev/null || echo 0); ocr_high=${ocr_high:-0}
           gl=$(cat .gl_count 2>/dev/null || echo 0); tv=$(cat .tv_count 2>/dev/null || echo 0); sg=$(cat .sg_count 2>/dev/null || echo 0)
           crit="${ASSET_CRITICALITY:-high}"
