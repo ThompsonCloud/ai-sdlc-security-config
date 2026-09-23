@@ -60,6 +60,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
             fs /repo --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --format sarif --output /repo/trivy.sarif --quiet || true
+          # 原生 JSON 供 DefectDojo「Trivy Scan」解析器（mitigation=修复版本、含 CVE/references）
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
+            fs /repo --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --format json --output /repo/trivy.json --quiet || true
           docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
             fs /repo --format cyclonedx --output /repo/sbom.cdx.json --quiet || true
           tv=$(python3 -c "import json;d=json.load(open('trivy.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo 0)
@@ -75,6 +78,9 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" semgrep/semgrep:latest \
             semgrep scan --config=p/python --config=p/security-audit --metrics=off --sarif --output=/src/semgrep.sarif /src || true
+          # 原生 JSON 供 DefectDojo「Semgrep JSON Report」解析器（mitigation=规则 fix/metadata）
+          docker run --rm -v "$PWD:/src" semgrep/semgrep:latest \
+            semgrep scan --config=p/python --config=p/security-audit --metrics=off --json --output=/src/semgrep.json /src || true
           sgall=$(python3 -c "import json;d=json.load(open('semgrep.sarif'));print(sum(len(r.get('results',[])) for r in d.get('runs',[])))" 2>/dev/null || echo 0)
           sgerr=$(python3 -c "import json;d=json.load(open('semgrep.sarif'));print(sum(1 for r in d.get('runs',[]) for x in r.get('results',[]) if x.get('level')=='error'))" 2>/dev/null || echo 0)
           echo "${sgerr:-0}" > .sg_count
@@ -124,8 +130,9 @@ jobs:
           # ocr 走 Generic Findings Import（带 mitigation 修复建议 + steps_to_reproduce 复现步骤）
           reimport_one ocr-generic.json "ocr-AI评审" "Generic Findings Import"
           reimport_one gitleaks.sarif   "gitleaks-密钥"
-          reimport_one trivy.sarif      "trivy-依赖"
-          reimport_one semgrep.sarif    "semgrep-静态"
+          # trivy/semgrep 改走各自原生解析器，DefectDojo 会填 mitigation（trivy=修复版本、semgrep=规则 fix）
+          reimport_one trivy.json       "trivy-依赖" "Trivy Scan"
+          reimport_one semgrep.json     "semgrep-静态" "Semgrep JSON Report"
           echo "## 📇 节点⑥ DefectDojo 台账（reimport-scan · 按工具分 test）：${imported:- (无)}（product=$DD_PRODUCT / engagement=CI-Security；ocr 带修复建议+复现步骤）" >> "$GITHUB_STEP_SUMMARY"
 
       # ⑦ 门禁：OPA/Rego 策略即代码（策略取自中央仓库 policy/gate.rego，版本化）
